@@ -11,13 +11,14 @@ Country partition is a validated-safe hard block (zero cross-country matches
 found in the EDA); each country is processed independently and in isolation,
 which is also what bounds memory at this record count.
 
-Run under `python -m cudf.pandas run_blocking.py ...` for the same reason as
-Phase A: everything here is written against the plain pandas API. In
-practice the heaviest per-country step (sparse TF-IDF retrieval) is CPU-bound
-scipy/sklearn regardless -- cudf.pandas does not accelerate scipy.sparse or
-sklearn calls, only pandas ones -- so the GPU benefit here is smaller than in
-Phase A; it's kept for consistency and because reading/writing the parquet
-files at this scale IS a pandas operation that benefits.
+Run with plain `python run_blocking.py ...`, NOT under `python -m cudf.pandas`.
+The GPU-heavy steps (TF-IDF retrieval, embedding, embedding search) run on
+PyTorch directly and don't need cudf.pandas. On the qBraid box, cudf.pandas
+is actively harmful here: cuDF relies on CuPy, and after cuML's install
+pulled in a CUDA 12.9 runtime compiler (NVRTC) against a 12.8 driver, any
+cuDF operation that needs a runtime-compiled kernel -- including its own
+fallback-to-pandas conversion -- fails with CUDA_ERROR_INVALID_IMAGE (hit
+live in the exact-match step, after the GPU TF-IDF step had succeeded).
 """
 import argparse
 import gc
