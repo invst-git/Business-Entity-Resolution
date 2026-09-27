@@ -48,29 +48,69 @@ def embed_texts(model, texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=Fal
 
 
 def build_ann_index(candidate_embeddings: np.ndarray):
-    """Flat inner-product index over L2-normalized vectors == exact cosine
-    similarity search. Flat (exact), not an approximate index (IVF/HNSW), by
-    default: correctness first -- an approximate index is a legitimate later
-    optimization once flat search is confirmed too slow at real scale on the
-    target hardware, not a default assumed up front."""
-    import faiss
-    d = candidate_embeddings.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(candidate_embeddings.astype(np.float32))
-    return index
+    """Tries cuML's GPU brute-force KNN first, falls back to FAISS CPU flat
+    search only when cuML isn't available (e.g. local/small-scale testing).
+
+    This fallback matters: a CPU flat (exact) search is O(n_anchors *
+    n_candidates * dim) with no GPU parallelism at all, and at this
+    project's real scale that is not a "slower but viable" option, it is
+    hours-to-days per country/target-source pair -- confirmed in practice,
+    not just estimated (a single US-partition search stalled at 0% GPU
+    utilization for 25+ minutes before being killed). GPU brute-force KNN
+    turns the same computation (~4x10^15 FLOPs for the US partition alone)
+    into a task an A100 finishes in seconds to low minutes. Both paths do
+    EXACT search -- this is a backend change, not an accuracy trade-off; an
+    approximate index (IVF/HNSW) remains a legitimate later optimization if
+    even GPU exact search proves too slow, not a default assumed here."""
+    try:
+        from cuml.neighbors import NearestNeighbors  # noqa: F401 -- import-checked only
+        return ("cuml", candidate_embeddings.astype(np.float32))
+    except ImportError:
+        import faiss
+        d = candidate_embeddings.shape[1]
+        index = faiss.IndexFlatIP(d)
+        index.add(candidate_embeddings.astype(np.float32))
+        return ("faiss", index)
 
 
 def top_k_per_anchor(index, anchor_embeddings: np.ndarray, k: int):
     """Returns (anchor_idx, candidate_idx, similarity) parallel arrays -- same
     shape/contract as tfidf_blocking.top_k_per_anchor, so every channel feeds
-    meta_blocking.union_edges identically."""
-    k = min(k, index.ntotal)
-    if k == 0 or anchor_embeddings.shape[0] == 0:
+    meta_blocking.union_edges identically. `index` is whatever
+    build_ann_index() returned (a (backend, payload) tuple)."""
+    backend, payload = index
+    n_anchors = anchor_embeddings.shape[0]
+
+    if backend == "cuml":
+        from cuml.neighbors import NearestNeighbors
+        n_candidates = payload.shape[0]
+        k_eff = min(k, n_candidates)
+        if k_eff == 0 or n_anchors == 0:
+            empty = np.array([], dtype=np.int64)
+            return empty, empty, np.array([], dtype=np.float32)
+        nn = NearestNeighbors(n_neighbors=k_eff, metric="euclidean")
+        nn.fit(payload)
+        dist, idxs = nn.kneighbors(anchor_embeddings.astype(np.float32))
+        dist = np.asarray(dist)
+        idxs = np.asarray(idxs)
+        # Both sides are L2-normalized, so for unit vectors:
+        # ||a-b||^2 = 2 - 2*cos_sim  =>  cos_sim = 1 - ||a-b||^2 / 2.
+        # Used instead of asking cuML for cosine/inner-product directly
+        # since 'euclidean' is the one metric guaranteed supported by every
+        # cuML brute-force KNN version -- this identity gets the same exact
+        # cosine ranking without depending on less-universal metric support.
+        sims = 1.0 - (dist ** 2) / 2.0
+        anchor_idx = np.repeat(np.arange(n_anchors), k_eff)
+        cand_idx = idxs.ravel()
+        sim_flat = sims.ravel()
+        return anchor_idx.astype(np.int64), cand_idx.astype(np.int64), sim_flat.astype(np.float32)
+
+    k_eff = min(k, payload.ntotal)
+    if k_eff == 0 or n_anchors == 0:
         empty = np.array([], dtype=np.int64)
         return empty, empty, np.array([], dtype=np.float32)
-    sims, idxs = index.search(anchor_embeddings.astype(np.float32), k)
-    n_anchors = anchor_embeddings.shape[0]
-    anchor_idx = np.repeat(np.arange(n_anchors), k)
+    sims, idxs = payload.search(anchor_embeddings.astype(np.float32), k_eff)
+    anchor_idx = np.repeat(np.arange(n_anchors), k_eff)
     cand_idx = idxs.ravel()
     sim_flat = sims.ravel()
     valid = cand_idx >= 0  # faiss returns -1 when the index has fewer than k vectors
