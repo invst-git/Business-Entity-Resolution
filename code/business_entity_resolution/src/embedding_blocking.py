@@ -24,6 +24,8 @@ low, the fallback is restricting this channel to records where the lexical
 channels (n-gram/phonetic/exact) found nothing, rather than running it over
 every record.
 """
+import time
+
 import numpy as np
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-large-instruct"
@@ -47,33 +49,49 @@ def embed_texts(model, texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=Fal
     )
 
 
-def build_ann_index(candidate_embeddings: np.ndarray):
-    """Tries cuML's GPU brute-force KNN first, falls back to FAISS CPU flat
-    search only when cuML isn't available (e.g. local/small-scale testing).
-
-    This fallback matters: a CPU flat (exact) search is O(n_anchors *
-    n_candidates * dim) with no GPU parallelism at all, and at this
-    project's real scale that is not a "slower but viable" option, it is
-    hours-to-days per country/target-source pair -- confirmed in practice,
-    not just estimated (a single US-partition search stalled at 0% GPU
-    utilization for 25+ minutes before being killed). GPU brute-force KNN
-    turns the same computation (~4x10^15 FLOPs for the US partition alone)
-    into a task an A100 finishes in seconds to low minutes. Both paths do
-    EXACT search -- this is a backend change, not an accuracy trade-off; an
-    approximate index (IVF/HNSW) remains a legitimate later optimization if
-    even GPU exact search proves too slow, not a default assumed here."""
-    try:
-        from cuml.neighbors import NearestNeighbors  # noqa: F401 -- import-checked only
-        return ("cuml", candidate_embeddings.astype(np.float32))
-    except ImportError:
-        import faiss
-        d = candidate_embeddings.shape[1]
-        index = faiss.IndexFlatIP(d)
-        index.add(candidate_embeddings.astype(np.float32))
-        return ("faiss", index)
+SEARCH_BATCH_SIZE = 1024
 
 
-def top_k_per_anchor(index, anchor_embeddings: np.ndarray, k: int):
+def build_ann_index(candidate_embeddings: np.ndarray, device=None):
+    """Exact cosine search index. GPU (PyTorch) when available: embeddings are
+    L2-normalized, so cosine similarity is a plain matrix multiply, and exact
+    search over ~3M x 1024 candidates is ~8x10^15 FLOPs for the US block --
+    tens of seconds on an A100 in fp16, versus hours-to-days as a CPU flat
+    search (hit live: a CPU FAISS search sat at 0% GPU for 25+ minutes).
+
+    PyTorch rather than cuML/CuPy: on the qBraid box those runtime-compile
+    kernels through a CUDA 12.9 NVRTC the 12.8 driver rejects
+    (CUDA_ERROR_INVALID_IMAGE, hit live), and cuML additionally needed
+    LD_LIBRARY_PATH surgery. PyTorch's kernels are precompiled and already
+    proven in this process (the embedding step runs on it).
+
+    `device` overrides auto-detection ("cpu" is used to test this exact code
+    path locally). Falls back to FAISS CPU flat search when neither applies.
+    Both paths are EXACT search -- a backend change, not an accuracy
+    trade-off."""
+    torch = None
+    if device is None:
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                torch, device = _torch, "cuda"
+        except Exception:
+            pass
+    else:
+        import torch as _torch
+        torch = _torch
+    if torch is not None:
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        cand = torch.from_numpy(candidate_embeddings.astype(np.float32)).to(device=device, dtype=dtype)
+        return ("torch", (torch, device, dtype, cand))
+    import faiss
+    d = candidate_embeddings.shape[1]
+    index = faiss.IndexFlatIP(d)
+    index.add(candidate_embeddings.astype(np.float32))
+    return ("faiss", index)
+
+
+def top_k_per_anchor(index, anchor_embeddings: np.ndarray, k: int, log=None):
     """Returns (anchor_idx, candidate_idx, similarity) parallel arrays -- same
     shape/contract as tfidf_blocking.top_k_per_anchor, so every channel feeds
     meta_blocking.union_edges identically. `index` is whatever
@@ -81,29 +99,28 @@ def top_k_per_anchor(index, anchor_embeddings: np.ndarray, k: int):
     backend, payload = index
     n_anchors = anchor_embeddings.shape[0]
 
-    if backend == "cuml":
-        from cuml.neighbors import NearestNeighbors
-        n_candidates = payload.shape[0]
-        k_eff = min(k, n_candidates)
+    if backend == "torch":
+        torch, device, dtype, cand = payload
+        k_eff = min(k, cand.shape[0])
         if k_eff == 0 or n_anchors == 0:
             empty = np.array([], dtype=np.int64)
             return empty, empty, np.array([], dtype=np.float32)
-        nn = NearestNeighbors(n_neighbors=k_eff, metric="euclidean")
-        nn.fit(payload)
-        dist, idxs = nn.kneighbors(anchor_embeddings.astype(np.float32))
-        dist = np.asarray(dist)
-        idxs = np.asarray(idxs)
-        # Both sides are L2-normalized, so for unit vectors:
-        # ||a-b||^2 = 2 - 2*cos_sim  =>  cos_sim = 1 - ||a-b||^2 / 2.
-        # Used instead of asking cuML for cosine/inner-product directly
-        # since 'euclidean' is the one metric guaranteed supported by every
-        # cuML brute-force KNN version -- this identity gets the same exact
-        # cosine ranking without depending on less-universal metric support.
-        sims = 1.0 - (dist ** 2) / 2.0
-        anchor_idx = np.repeat(np.arange(n_anchors), k_eff)
-        cand_idx = idxs.ravel()
-        sim_flat = sims.ravel()
-        return anchor_idx.astype(np.int64), cand_idx.astype(np.int64), sim_flat.astype(np.float32)
+        out_a, out_c, out_s = [], [], []
+        n_batches = (n_anchors + SEARCH_BATCH_SIZE - 1) // SEARCH_BATCH_SIZE
+        report_every = max(1, n_batches // 20)
+        t0 = time.time()
+        for b, start in enumerate(range(0, n_anchors, SEARCH_BATCH_SIZE)):
+            end = min(start + SEARCH_BATCH_SIZE, n_anchors)
+            q = torch.from_numpy(anchor_embeddings[start:end].astype(np.float32)).to(device=device, dtype=dtype)
+            vals, idx = torch.topk(q @ cand.T, k_eff, dim=1)
+            out_a.append(np.repeat(np.arange(start, end, dtype=np.int64), k_eff))
+            out_c.append(idx.cpu().numpy().astype(np.int64).ravel())
+            out_s.append(vals.float().cpu().numpy().astype(np.float32).ravel())
+            if log is not None and ((b + 1) % report_every == 0 or b + 1 == n_batches):
+                el = time.time() - t0
+                log(f"      embedding search {b + 1:,}/{n_batches:,} batches, "
+                    f"{el:.0f}s elapsed, ~{el / (b + 1) * (n_batches - b - 1):.0f}s remaining")
+        return np.concatenate(out_a), np.concatenate(out_c), np.concatenate(out_s)
 
     k_eff = min(k, payload.ntotal)
     if k_eff == 0 or n_anchors == 0:

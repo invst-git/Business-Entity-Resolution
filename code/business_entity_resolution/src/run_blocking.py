@@ -94,7 +94,7 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
         t0 = time.time()
         index = embedding_blocking.build_ann_index(target_embeddings)
         log(f"    ANN index backend: {index[0]}")
-        emb_edges = embedding_blocking.top_k_per_anchor(index, s1_embeddings, k)
+        emb_edges = embedding_blocking.top_k_per_anchor(index, s1_embeddings, k, log=log)
         log(f"    embedding search done in {time.time() - t0:.1f}s ({len(emb_edges[0]):,} edges)")
         channels.append(emb_edges)
 

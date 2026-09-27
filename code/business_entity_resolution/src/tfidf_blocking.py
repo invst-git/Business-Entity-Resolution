@@ -79,38 +79,50 @@ GPU_BATCH_SIZE = 256
 PROGRESS_EVERY = 0.05
 
 
-def _get_gpu_backend():
-    """(cupy, cupyx.scipy.sparse) if a working CUDA device is available, else
-    None. CuPy ships as a RAPIDS dependency, so on the qBraid box this should
-    already be importable; the device check guards against an install that
-    imports but has no usable GPU."""
+def get_torch_cuda():
+    """torch if a CUDA device is usable, else None. PyTorch, not CuPy: on the
+    qBraid box, installing cuML pulled in a CUDA 12.9 runtime compiler
+    (NVRTC) while the driver supports 12.8, so every kernel CuPy compiles at
+    runtime fails with CUDA_ERROR_INVALID_IMAGE (hit live). PyTorch ships
+    precompiled kernels and is already proven in the same process -- the
+    embedding step runs on it."""
     try:
-        import cupy
-        import cupyx.scipy.sparse as cpsp
-        cupy.cuda.runtime.getDeviceCount()
-        return cupy, cpsp
+        import torch
+        return torch if torch.cuda.is_available() else None
     except Exception:
         return None
 
 
-def top_k_dense_batches(anchor_matrix, candidate_matrix, k: int, xp, xsp,
-                         batch_size: int = GPU_BATCH_SIZE, log=None):
-    """Batched top-k via (sparse anchor batch @ sparse candidates^T) densified
-    per batch, then argpartition along each row -- all on whatever array
-    module `xp`/`xsp` is (cupy/cupyx on GPU; numpy/scipy for local testing of
-    the exact same logic). Densifying per batch is what makes this GPU-
-    friendly: top-k over a dense (batch x n_candidates) block is a single
-    vectorized op instead of a Python loop over sparse rows. Memory per batch
-    is batch_size * n_candidates * 4 bytes (256 x 3M ~= 3 GB), comfortably
-    within an 80 GB A100.
+def _to_torch_csr(m: sp.csr_matrix, torch, device):
+    # 32-bit indices: the most broadly supported form for GPU sparse-sparse
+    # matmul (cuSPARSE SpGEMM). Every size here fits (candidate matrix nnz
+    # ~1.6e8, dimensions ~1e6-3e6, per-batch product nnz < 256 * 3.1e6).
+    m = m.tocsr()
+    return torch.sparse_csr_tensor(
+        torch.from_numpy(m.indptr.astype(np.int32)),
+        torch.from_numpy(m.indices.astype(np.int32)),
+        torch.from_numpy(m.data.astype(np.float32)),
+        size=m.shape, device=device,
+    )
 
-    Same output contract as top_k_per_anchor: only strictly positive
-    similarities are kept (a zero means the pair shares no surviving n-gram,
-    which the sparse CPU path never emits either)."""
+
+def top_k_torch_batches(anchor_matrix: sp.csr_matrix, candidate_matrix: sp.csr_matrix, k: int,
+                         torch, device, batch_size: int = GPU_BATCH_SIZE, log=None):
+    """Batched top-k: (sparse anchor batch @ sparse candidates^T) on `device`,
+    densified per batch, then torch.topk along each row -- one vectorized op
+    per batch instead of a Python loop over sparse rows. The candidate
+    matrix is moved to the device once; each anchor batch is row-sliced on
+    the host (cheap) and moved per batch. Memory per batch is roughly
+    batch_size * n_candidates * 4 bytes (256 x 3M ~= 3 GB) plus the sparse
+    product, within an 80 GB A100.
+
+    Runs identically on device="cpu" (used to verify this exact logic against
+    the scipy path locally, where no GPU is available). Same output contract
+    as top_k_per_anchor: only strictly positive similarities are kept."""
     n_anchors, n_candidates = anchor_matrix.shape[0], candidate_matrix.shape[0]
     k = min(k, n_candidates)
-    A = xsp.csr_matrix(anchor_matrix)
-    CT = xsp.csr_matrix(candidate_matrix).T.tocsr()
+    anchor_matrix = anchor_matrix.tocsr()
+    CT = _to_torch_csr(candidate_matrix.T.tocsr(), torch, device)
 
     out_anchor, out_cand, out_sim = [], [], []
     n_batches = (n_anchors + batch_size - 1) // batch_size
@@ -118,23 +130,23 @@ def top_k_dense_batches(anchor_matrix, candidate_matrix, k: int, xp, xsp,
     t_start = time.time()
     for b, start in enumerate(range(0, n_anchors, batch_size)):
         end = min(start + batch_size, n_anchors)
-        dense = (A[start:end] @ CT).toarray()
-        top = xp.argpartition(-dense, k - 1, axis=1)[:, :k]
-        vals = xp.take_along_axis(dense, top, axis=1)
-        rows = xp.broadcast_to(xp.arange(start, end)[:, None], top.shape)
+        A_b = _to_torch_csr(anchor_matrix[start:end], torch, device)
+        dense = (A_b @ CT).to_dense()
+        vals, top = torch.topk(dense, k, dim=1)
         keep = vals > 0
-        out_anchor.append(rows[keep].astype(xp.int64))
-        out_cand.append(top[keep].astype(xp.int64))
-        out_sim.append(vals[keep].astype(xp.float32))
+        rows = torch.arange(start, end, device=device).unsqueeze(1).expand_as(top)
+        out_anchor.append(rows[keep].cpu().numpy().astype(np.int64))
+        out_cand.append(top[keep].cpu().numpy().astype(np.int64))
+        out_sim.append(vals[keep].cpu().numpy().astype(np.float32))
+        del A_b, dense, vals, top, keep, rows
         if log is not None and ((b + 1) % report_every == 0 or b + 1 == n_batches):
             elapsed = time.time() - t_start
             eta = elapsed / (b + 1) * (n_batches - b - 1)
             log(f"      tfidf retrieval {b + 1:,}/{n_batches:,} batches, "
                 f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining")
 
-    to_host = (lambda a: a.get()) if hasattr(xp, "asnumpy") else (lambda a: a)
-    return (to_host(xp.concatenate(out_anchor)), to_host(xp.concatenate(out_cand)),
-            to_host(xp.concatenate(out_sim)))
+    del CT
+    return np.concatenate(out_anchor), np.concatenate(out_cand), np.concatenate(out_sim)
 
 
 def top_k_per_anchor(anchor_matrix: sp.csr_matrix, candidate_matrix: sp.csr_matrix,
@@ -144,10 +156,10 @@ def top_k_per_anchor(anchor_matrix: sp.csr_matrix, candidate_matrix: sp.csr_matr
     output is already L2-normalized, so the sparse dot product IS the cosine
     similarity -- no separate normalization step needed.
 
-    Uses the GPU (CuPy/cuSPARSE, top_k_dense_batches) when available. The CPU
-    path below is the fallback: correct, but at full scale it is
-    single-threaded scipy -- measured ~5x10^7 multiply-adds/s, i.e. hours per
-    large country block even with block-size purging.
+    Uses the GPU (PyTorch, top_k_torch_batches) when available. The CPU path
+    below is the fallback: correct, but at full scale it is single-threaded
+    scipy -- measured ~5x10^7 multiply-adds/s, i.e. hours per large country
+    block even with block-size purging.
 
     Returns three parallel 1-D numpy arrays: anchor_row_idx, candidate_row_idx,
     similarity -- one triple per surviving (anchor, candidate) edge.
@@ -158,12 +170,11 @@ def top_k_per_anchor(anchor_matrix: sp.csr_matrix, candidate_matrix: sp.csr_matr
         empty = np.array([], dtype=np.int64)
         return empty, empty, np.array([], dtype=np.float32)
 
-    gpu = _get_gpu_backend() if use_gpu else None
-    if gpu is not None:
+    torch = get_torch_cuda() if use_gpu else None
+    if torch is not None:
         if log is not None:
-            log("      tfidf retrieval backend: GPU (cupy)")
-        cupy, cpsp = gpu
-        return top_k_dense_batches(anchor_matrix, candidate_matrix, k, cupy, cpsp, log=log)
+            log("      tfidf retrieval backend: GPU (torch)")
+        return top_k_torch_batches(anchor_matrix, candidate_matrix, k, torch, "cuda", log=log)
     if log is not None:
         log("      tfidf retrieval backend: CPU (scipy) -- slow at full scale")
 
