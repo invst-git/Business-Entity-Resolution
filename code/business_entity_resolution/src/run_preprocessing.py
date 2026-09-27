@@ -2,11 +2,25 @@
 Entry point. Run under `python -m cudf.pandas run_preprocessing.py ...` on a
 qBraid GPU environment for acceleration, or plain `python run_preprocessing.py ...`
 anywhere (CPU pandas) -- identical code path either way. See ../README.md.
+
+Can be invoked from any working directory, with any path (relative or
+absolute) to this file -- see the sys.path fix below for why that needs to be
+explicit rather than assumed.
 """
 import argparse
 import gc
 import os
+import sys
 import time
+
+# `python script.py` normally puts the script's own directory on sys.path
+# automatically, which is how the bare `import text_normalize` etc. below find
+# their sibling modules. `python -m cudf.pandas run_preprocessing.py` does NOT
+# do this -- it loads this file via runpy.run_path(), which does not add the
+# containing directory to sys.path the way direct interpreter invocation does.
+# Without this, running via cudf.pandas from any directory other than this
+# file's own raises ModuleNotFoundError on the very first sibling import.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import text_normalize as tn
 from address_parser import normalize_state_series, parse_addresses, state_confident_hit_series
