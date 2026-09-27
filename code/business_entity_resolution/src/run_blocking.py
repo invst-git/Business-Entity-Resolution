@@ -59,10 +59,15 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
         empty = np.array([], dtype=np.int64)
         return empty, empty, np.array([], dtype=np.float32)
 
+    t0 = time.time()
     s1_mat = tfidf_vec.transform(s1_c["core_name_compare"])
     target_mat = tfidf_vec.transform(target_c["core_name_compare"])
+    log(f"    tfidf transform done in {time.time() - t0:.1f}s -- retrieving top-{k}...")
+    t0 = time.time()
     tfidf_edges = tfidf_blocking.top_k_per_anchor(s1_mat, target_mat, k)
+    log(f"    tfidf retrieval done in {time.time() - t0:.1f}s ({len(tfidf_edges[0]):,} edges)")
 
+    t0 = time.time()
     exact_df = exact_blocking.exact_match_candidates(s1_c, target_c)
     if len(exact_df):
         exact_edges = (
@@ -73,15 +78,25 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
     else:
         empty = np.array([], dtype=np.int64)
         exact_edges = (empty, empty, np.array([], dtype=np.float32))
+    log(f"    exact-match done in {time.time() - t0:.1f}s ({len(exact_edges[0]):,} edges)")
 
     channels = [tfidf_edges, exact_edges]
     if embed_model is not None:
+        t0 = time.time()
         target_embeddings = embedding_blocking.embed_texts(embed_model, target_c["core_name"].tolist())
+        log(f"    embedded {len(target_c):,} candidates in {time.time() - t0:.1f}s -- building ANN index + searching...")
+        t0 = time.time()
         index = embedding_blocking.build_ann_index(target_embeddings)
-        channels.append(embedding_blocking.top_k_per_anchor(index, s1_embeddings, k))
+        log(f"    ANN index backend: {index[0]}")
+        emb_edges = embedding_blocking.top_k_per_anchor(index, s1_embeddings, k)
+        log(f"    embedding search done in {time.time() - t0:.1f}s ({len(emb_edges[0]):,} edges)")
+        channels.append(emb_edges)
 
+    t0 = time.time()
     merged = meta_blocking.union_edges(channels, len(s1_c), len(target_c))
-    return meta_blocking.prune_to_budget(merged, k)
+    result = meta_blocking.prune_to_budget(merged, k)
+    log(f"    union+prune done in {time.time() - t0:.1f}s")
+    return result
 
 
 def run_country(country: str, s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame, k: int,
