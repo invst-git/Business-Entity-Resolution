@@ -39,5 +39,10 @@ def write_parquet(df, path):
     df.to_parquet(path, index=False)
 
 
-def read_parquet(path):
-    return pd.read_parquet(path)
+def read_parquet(path, columns=None):
+    """`columns`, when given, is passed straight to pandas so reading just the
+    slim entity_id/country/state_raw columns for vocab-building doesn't
+    deserialize every other column of a multi-million-row parquet file --
+    genuinely valuable here since parquet is columnar and can skip the rest
+    at read time, unlike a TSV."""
+    return pd.read_parquet(path, columns=columns)

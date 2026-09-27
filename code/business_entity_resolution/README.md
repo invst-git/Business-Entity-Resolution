@@ -27,7 +27,8 @@ student_resource/                      <- clone/copy this whole repo to qBraid
 │       │   ├── name_parser.py       # rename-marker split, honorific strip, suffix extraction
 │       │   ├── address_parser.py    # component parsing, house#/postal/state extraction
 │       │   ├── vocab_builder.py     # learns native-script<->state map (train) + France locality vocab (test)
-│       │   └── run_preprocessing.py # CLI entry point
+│       │   ├── run_preprocessing.py # CLI entry point
+│       │   └── resume_vocab_from_parquet.py  # recovery: see "If a run gets interrupted" below
 │       ├── scripts/
 │       │   ├── download_dataset.sh          # Drive (public link) -> dataset/, via gdown
 │       │   ├── download_dataset_rclone.sh   # Drive (private) -> dataset/, via rclone
@@ -151,6 +152,35 @@ returns something), so a non-empty `state_norm` is not evidence it's *correct*
 -- the tier1or2 hit rate is. Sanity-check these against the EDA report before
 moving on; a sudden drop where you expect ~90%+ usually means a path or
 encoding problem, not real data.
+
+## If a run gets interrupted after train finishes parsing
+
+`run_train()` writes each `train_source*_clean.parquet` as soon as that file's
+name/address parsing completes, *before* building the native-script vocab.
+If the vocab-building step (or anything after it) gets killed, hangs, or
+errors out -- train parsing already succeeded and doesn't need to be redone.
+Resume from there instead of re-running the whole thing from scratch:
+
+```bash
+python resume_vocab_from_parquet.py \
+  --input-dir ../../../dataset \
+  --output-dir ../../../processed \
+  --artifacts-dir ../../../artifacts
+```
+
+This reads the three already-written train parquet files (slim columns only),
+builds and saves the vocab, and re-applies it to those same files in place --
+exactly the second half of `run_train()`, just skipped straight to. It prints
+the exact follow-up command for test when it finishes:
+
+```bash
+python -m cudf.pandas run_preprocessing.py --only test --skip-vocab \
+  --input-dir ../../../dataset --output-dir ../../../processed --artifacts-dir ../../../artifacts
+```
+
+No need for `cudf.pandas` on the resume step itself -- it's a handful of
+seconds of plain Python/pandas work at this scale, not worth any GPU-proxy
+overhead.
 
 ## What gets learned vs. hardcoded (fair-play note)
 
