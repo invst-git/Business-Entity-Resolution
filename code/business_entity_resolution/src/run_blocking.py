@@ -49,21 +49,6 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def add_blocking_text(df: pd.DataFrame) -> pd.DataFrame:
-    """core_name_blocking: romanized for India rows (so the n-gram/phonetic
-    channels have Latin text to compare against the English-spelled S1
-    anchors), core_name as-is otherwise. A new column -- core_name itself is
-    left untouched for the exact-match and embedding channels."""
-    out = df.copy()
-    out["core_name_blocking"] = out["core_name"]
-    india_mask = out["country"] == "India"
-    if india_mask.any():
-        out.loc[india_mask, "core_name_blocking"] = transliteration.romanized_series(
-            out.loc[india_mask, "core_name"]
-        )
-    return out
-
-
 def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: int,
                       embed_model=None, s1_embeddings=None):
     """Runs the TF-IDF, exact-match, and (if enabled) embedding channels for
@@ -74,8 +59,8 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
         empty = np.array([], dtype=np.int64)
         return empty, empty, np.array([], dtype=np.float32)
 
-    s1_mat = tfidf_vec.transform(s1_c["core_name_blocking"])
-    target_mat = tfidf_vec.transform(target_c["core_name_blocking"])
+    s1_mat = tfidf_vec.transform(s1_c["core_name_compare"])
+    target_mat = tfidf_vec.transform(target_c["core_name_compare"])
     tfidf_edges = tfidf_blocking.top_k_per_anchor(s1_mat, target_mat, k)
 
     exact_df = exact_blocking.exact_match_candidates(s1_c, target_c)
@@ -110,11 +95,11 @@ def run_country(country: str, s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFra
         return result
 
     log(f"[{country}] s1={len(s1_c):,} s2={len(s2_c):,} s3={len(s3_c):,} -- adding blocking text...")
-    s1_c = add_blocking_text(s1_c)
-    s2_c = add_blocking_text(s2_c)
-    s3_c = add_blocking_text(s3_c)
+    s1_c = transliteration.add_compare_name(s1_c)
+    s2_c = transliteration.add_compare_name(s2_c)
+    s3_c = transliteration.add_compare_name(s3_c)
 
-    all_text = pd.concat([s1_c["core_name_blocking"], s2_c["core_name_blocking"], s3_c["core_name_blocking"]])
+    all_text = pd.concat([s1_c["core_name_compare"], s2_c["core_name_compare"], s3_c["core_name_compare"]])
     log(f"[{country}] fitting shared TF-IDF vectorizer on {len(all_text):,} texts...")
     tfidf_vec = tfidf_blocking.fit_vectorizer(all_text)
     log(f"[{country}] vocab size={len(tfidf_vec.vocabulary_):,}")

@@ -104,3 +104,30 @@ def romanized_series(core_name: pd.Series) -> pd.Series:
     """
     romanized = core_name.fillna("").apply(romanize)
     return tn.strip_accents(romanized).str.lower()
+
+
+def add_compare_name(df: pd.DataFrame, name_col: str = "core_name",
+                      ascii_col: str = "core_name_ascii", country_col: str = "country",
+                      out_col: str = "core_name_compare") -> pd.DataFrame:
+    """The SINGLE source of truth for the cross-script-comparable name field,
+    used identically by run_blocking.py (candidate retrieval) and
+    feature_engineering.py (scoring the pairs blocking found). This must be
+    one shared function, not two independent implementations: if blocking
+    retrieves a candidate using one romanization/accent-folding path and
+    feature engineering scores it using a second, slightly different path,
+    the model trains on features computed from text that doesn't match what
+    it was actually retrieved on -- a silent, hard-to-detect mismatch.
+
+    Accent-folded (via the already-computed `core_name_ascii`) for EVERY
+    country by default, not just non-India -- an earlier draft left India
+    as the only country going through accent-folding, which meant French
+    records kept accents (Emile vs Émile) while India records didn't,
+    an inconsistency with no justification. India rows are further
+    romanized from native script on top of that.
+    """
+    out = df.copy()
+    out[out_col] = out[ascii_col]
+    india_mask = out[country_col] == "India"
+    if india_mask.any():
+        out.loc[india_mask, out_col] = romanized_series(out.loc[india_mask, name_col])
+    return out
