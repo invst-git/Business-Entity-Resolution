@@ -79,7 +79,7 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
                       embed_model=None, s1_embeddings=None,
                       max_block_size: int = tfidf_blocking.MAX_BLOCK_SIZE,
                       exact_max_block: int = exact_blocking.MAX_KEY_BLOCK,
-                      na_vec=None):
+                      na_vec=None, na_max_block_size: int = 5000):
     """Runs the name TF-IDF, name+address TF-IDF, exact-match, and (if
     enabled) embedding channels for one (country, target source) pair,
     fuses them by reciprocal rank, returns (anchor_idx, candidate_idx,
@@ -92,7 +92,7 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
     tfidf_edges = tfidf_channel("name", tfidf_vec, s1_c["core_name_compare"], target_c["core_name_compare"],
                                 k, max_block_size)
     na_edges = tfidf_channel("name+address", na_vec, name_address_text(s1_c), name_address_text(target_c),
-                             k, max_block_size)
+                             k, na_max_block_size)
 
     t0 = time.time()
     exact_df = exact_blocking.exact_match_candidates(s1_c, target_c, exact_max_block)
