@@ -13,5 +13,15 @@ rapidfuzz>=3.0
 jellyfish>=1.0
 scikit-learn>=1.3
 
+# Phase B (blocking): src/run_blocking.py
+indic-transliteration>=2.3   # MIT-licensed Sanscript engine, India romanization
+sentence-transformers>=3.0   # embedding channel (multilingual-e5-large-instruct)
+faiss-cpu>=1.8                # ANN index for the embedding channel. If cuML is
+# confirmed available on the target GPU box (check: python -c "import cuml"),
+# faiss-gpu or a cuml-based nearest-neighbor search is a legitimate faster
+# substitute for build_ann_index/top_k_per_anchor in embedding_blocking.py --
+# not swapped in by default here since that was never verified against this
+# project's actual qBraid environment.
+
 # Drive -> qBraid dataset transfer
 gdown>=5.0
