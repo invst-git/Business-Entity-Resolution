@@ -21,23 +21,40 @@ MIN_AGREEMENT = 0.9
 
 def build_native_state_map(s1_state: pd.DataFrame, s2_state: pd.DataFrame,
                             s3_state: pd.DataFrame, ground_truth: pd.DataFrame) -> dict:
+    """
+    Converts every input to plain Python dicts/lists up front, then does the
+    whole 2.2M-row x ~3.46-avg-match loop in pure Python with zero further
+    pandas/cudf object involvement.
+
+    This isn't just a style choice: under `python -m cudf.pandas`, every
+    DataFrame here -- including these small "slim" ones -- is a GPU-backed
+    proxy object. The original version used `ground_truth.itertuples()` with
+    nested `.at[scalar]` lookups into s1_map/s2_map/s3_map: roughly 7.6M
+    individual scalar accesses. Under plain CPU pandas that's a cheap hash
+    lookup each time; under cudf.pandas, `.at[]` is not a bulk operation
+    cuDF is built for, and each call can trigger its own GPU round-trip
+    (kernel dispatch + host<->device transfer). 7.6M of those individually
+    turned a job that finishes in seconds into one that never finished in
+    over an hour, confirmed live against a real qBraid GPU run. `.tolist()`
+    forces one bulk conversion per column regardless of backing store, and
+    plain dict/list access afterward has no GPU involvement at all.
+    """
+    s1_map = dict(zip(s1_state["entity_id"].tolist(), s1_state["state_raw"].tolist()))
+    s2_map = dict(zip(s2_state["entity_id"].tolist(), s2_state["state_raw"].tolist()))
+    s3_map = dict(zip(s3_state["entity_id"].tolist(), s3_state["state_raw"].tolist()))
+    gt_s1_ids = ground_truth["source1_entity_id"].tolist()
+    gt_matched = ground_truth["matched_entity_ids"].tolist()
+
     votes = defaultdict(Counter)
-
-    s1_map = s1_state.set_index("entity_id")
-    s2_map = s2_state.set_index("entity_id")
-    s3_map = s3_state.set_index("entity_id")
-
-    for s1_id, matched in ground_truth.itertuples(index=False, name=None):
-        if not matched or s1_id not in s1_map.index:
+    for s1_id, matched in zip(gt_s1_ids, gt_matched):
+        if not matched:
             continue
-        s1_state_val = s1_map.at[s1_id, "state_raw"]
+        s1_state_val = s1_map.get(s1_id)
         if not s1_state_val or not s1_state_val.isascii():
             continue
         for mid in matched.split(","):
             src_map = s2_map if mid.startswith("S2-") else s3_map
-            if mid not in src_map.index:
-                continue
-            other_state = src_map.at[mid, "state_raw"]
+            other_state = src_map.get(mid)
             if other_state and not other_state.isascii():
                 votes[other_state][s1_state_val] += 1
 
