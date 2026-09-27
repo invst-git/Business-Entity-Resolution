@@ -50,7 +50,9 @@ def log(msg):
 
 
 def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: int,
-                      embed_model=None, s1_embeddings=None):
+                      embed_model=None, s1_embeddings=None,
+                      max_block_size: int = tfidf_blocking.MAX_BLOCK_SIZE,
+                      exact_max_block: int = exact_blocking.MAX_KEY_BLOCK):
     """Runs the TF-IDF, exact-match, and (if enabled) embedding channels for
     one (country, target source) pair, returns (anchor_idx, candidate_idx,
     weight) edges pruned to budget k. `s1_embeddings` is precomputed once per
@@ -62,13 +64,17 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
     t0 = time.time()
     s1_mat = tfidf_vec.transform(s1_c["core_name_compare"])
     target_mat = tfidf_vec.transform(target_c["core_name_compare"])
-    log(f"    tfidf transform done in {time.time() - t0:.1f}s -- retrieving top-{k}...")
+    s1_mat, target_mat, n_kept, n_dropped = tfidf_blocking.prune_common_terms(
+        s1_mat, target_mat, max_block_size
+    )
+    log(f"    tfidf transform done in {time.time() - t0:.1f}s -- kept {n_kept:,} n-grams, "
+        f"purged {n_dropped:,} with candidate block size > {max_block_size:,} -- retrieving top-{k}...")
     t0 = time.time()
-    tfidf_edges = tfidf_blocking.top_k_per_anchor(s1_mat, target_mat, k)
+    tfidf_edges = tfidf_blocking.top_k_per_anchor(s1_mat, target_mat, k, log=log)
     log(f"    tfidf retrieval done in {time.time() - t0:.1f}s ({len(tfidf_edges[0]):,} edges)")
 
     t0 = time.time()
-    exact_df = exact_blocking.exact_match_candidates(s1_c, target_c)
+    exact_df = exact_blocking.exact_match_candidates(s1_c, target_c, exact_max_block)
     if len(exact_df):
         exact_edges = (
             exact_df["anchor_row"].to_numpy(dtype=np.int64),
@@ -100,7 +106,8 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
 
 
 def run_country(country: str, s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame, k: int,
-                 embed_model=None) -> dict:
+                 embed_model=None, max_block_size: int = tfidf_blocking.MAX_BLOCK_SIZE,
+                 exact_max_block: int = exact_blocking.MAX_KEY_BLOCK) -> dict:
     """Returns {s1_entity_id: set(candidate_entity_id)} for this country."""
     s1_c = s1[s1["country"] == country].reset_index(drop=True)
     s2_c = s2[s2["country"] == country].reset_index(drop=True)
@@ -132,7 +139,9 @@ def run_country(country: str, s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFra
         log(f"[{country}] blocking against {tag} ({len(target_c):,} candidates)...")
         t0 = time.time()
         a_idx, c_idx, _ = block_one_target(s1_c, target_c, tfidf_vec, k,
-                                            embed_model=embed_model, s1_embeddings=s1_embeddings)
+                                            embed_model=embed_model, s1_embeddings=s1_embeddings,
+                                            max_block_size=max_block_size,
+                                            exact_max_block=exact_max_block)
         log(f"[{country}] {tag}: {len(a_idx):,} candidate edges in {time.time() - t0:.1f}s")
         s1_ids = s1_c["entity_id"].to_numpy()
         cand_ids = target_c["entity_id"].to_numpy()
@@ -160,6 +169,10 @@ def main():
     ap.add_argument("--output-dir", required=True, help="where candidate_pairs.tsv is written")
     ap.add_argument("--split", choices=["train", "test"], required=True)
     ap.add_argument("--k", type=int, default=CANDIDATE_BUDGET)
+    ap.add_argument("--max-block-size", type=int, default=tfidf_blocking.MAX_BLOCK_SIZE,
+                     help="purge n-grams shared by more than this many candidates (TF-IDF channel)")
+    ap.add_argument("--exact-max-block", type=int, default=exact_blocking.MAX_KEY_BLOCK,
+                     help="purge exact-match keys shared by more than this many records on either side")
     ap.add_argument("--use-embeddings", action="store_true",
                      help="enable the embedding-ANN channel (heaviest compute item -- "
                           "run scripts/probe_embedding_throughput.py first to size it)")
@@ -183,7 +196,9 @@ def main():
     candidate_map = {}
     for country in COUNTRIES:
         t0 = time.time()
-        country_result = run_country(country, s1, s2, s3, args.k, embed_model=embed_model)
+        country_result = run_country(country, s1, s2, s3, args.k, embed_model=embed_model,
+                                     max_block_size=args.max_block_size,
+                                     exact_max_block=args.exact_max_block)
         candidate_map.update(country_result)
         log(f"[{country}] done in {time.time() - t0:.1f}s")
         gc.collect()

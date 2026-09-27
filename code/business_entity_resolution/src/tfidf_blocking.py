@@ -21,6 +21,8 @@ an inverted-index lookup, and keeping this as plain scipy sparse arithmetic
 (rather than a wrapped NearestNeighbors call) leaves room for a GPU-array
 substitution later without restructuring the algorithm.
 """
+import time
+
 import numpy as np
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -28,7 +30,40 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 NGRAM_RANGE = (3, 5)
 MAX_DF = 0.3
 MIN_DF = 2
-BATCH_SIZE = 2000
+BATCH_SIZE = 1000
+# Absolute cap on how many CANDIDATE records may share an n-gram for that
+# n-gram to be used for retrieval (block purging). The relative MAX_DF above
+# is not enough on its own: at ~3M candidates, 0.3 still permits n-gram
+# "blocks" of ~900K records, so nearly every anchor shares some surviving
+# trigram with nearly every candidate and the sparse product degenerates to
+# near all-pairs. Extrapolated from a measured 1.3s on an 8.9K x 14.8K sample,
+# the uncapped US x S2 retrieval would take ~11 hours. An absolute cap bounds
+# the work per anchor (<= n-grams-per-name * cap) regardless of corpus size.
+# Chosen from a measured recall/compute curve on a real 15K-GT-row sample
+# (US, S1 vs S2), with the cap scaled proportionally to full size:
+#   cap(full)   full-set recall   ~full multiply-adds (US x S2)
+#   none        97.7%             2.1e12
+#   ~41K        97.3%             5.4e11
+#   ~20K        96.4%             2.7e11
+#   ~10K        92.3%             8.3e10
+#   ~1K         77.8%             3.4e9
+# 40K keeps recall within ~0.4pp of uncapped at ~4x less work. Smaller caps
+# (an earlier draft used 1000) cost far too much recall: short/generic
+# business names are made almost entirely of common n-grams, so aggressive
+# purging leaves them nothing to match on.
+MAX_BLOCK_SIZE = 40000
+
+
+def prune_common_terms(anchor_matrix: sp.csr_matrix, candidate_matrix: sp.csr_matrix,
+                        max_block_size: int = MAX_BLOCK_SIZE):
+    """Drops vocabulary columns whose candidate-side document frequency
+    exceeds max_block_size, from BOTH matrices (same columns on both sides,
+    so dot products stay comparable). Returns (anchor_matrix, candidate_matrix,
+    n_kept, n_dropped). Dropping columns from L2-normalized rows keeps every
+    dot product <= 1, so the scores remain valid ranking weights."""
+    col_df = np.bincount(candidate_matrix.indices, minlength=candidate_matrix.shape[1])
+    keep = col_df <= max_block_size
+    return anchor_matrix[:, keep], candidate_matrix[:, keep], int(keep.sum()), int((~keep).sum())
 
 
 def fit_vectorizer(texts, max_df=MAX_DF, min_df=MIN_DF, ngram_range=NGRAM_RANGE):
@@ -40,12 +75,79 @@ def fit_vectorizer(texts, max_df=MAX_DF, min_df=MIN_DF, ngram_range=NGRAM_RANGE)
     return vec
 
 
+GPU_BATCH_SIZE = 256
+PROGRESS_EVERY = 0.05
+
+
+def _get_gpu_backend():
+    """(cupy, cupyx.scipy.sparse) if a working CUDA device is available, else
+    None. CuPy ships as a RAPIDS dependency, so on the qBraid box this should
+    already be importable; the device check guards against an install that
+    imports but has no usable GPU."""
+    try:
+        import cupy
+        import cupyx.scipy.sparse as cpsp
+        cupy.cuda.runtime.getDeviceCount()
+        return cupy, cpsp
+    except Exception:
+        return None
+
+
+def top_k_dense_batches(anchor_matrix, candidate_matrix, k: int, xp, xsp,
+                         batch_size: int = GPU_BATCH_SIZE, log=None):
+    """Batched top-k via (sparse anchor batch @ sparse candidates^T) densified
+    per batch, then argpartition along each row -- all on whatever array
+    module `xp`/`xsp` is (cupy/cupyx on GPU; numpy/scipy for local testing of
+    the exact same logic). Densifying per batch is what makes this GPU-
+    friendly: top-k over a dense (batch x n_candidates) block is a single
+    vectorized op instead of a Python loop over sparse rows. Memory per batch
+    is batch_size * n_candidates * 4 bytes (256 x 3M ~= 3 GB), comfortably
+    within an 80 GB A100.
+
+    Same output contract as top_k_per_anchor: only strictly positive
+    similarities are kept (a zero means the pair shares no surviving n-gram,
+    which the sparse CPU path never emits either)."""
+    n_anchors, n_candidates = anchor_matrix.shape[0], candidate_matrix.shape[0]
+    k = min(k, n_candidates)
+    A = xsp.csr_matrix(anchor_matrix)
+    CT = xsp.csr_matrix(candidate_matrix).T.tocsr()
+
+    out_anchor, out_cand, out_sim = [], [], []
+    n_batches = (n_anchors + batch_size - 1) // batch_size
+    report_every = max(1, int(n_batches * PROGRESS_EVERY))
+    t_start = time.time()
+    for b, start in enumerate(range(0, n_anchors, batch_size)):
+        end = min(start + batch_size, n_anchors)
+        dense = (A[start:end] @ CT).toarray()
+        top = xp.argpartition(-dense, k - 1, axis=1)[:, :k]
+        vals = xp.take_along_axis(dense, top, axis=1)
+        rows = xp.broadcast_to(xp.arange(start, end)[:, None], top.shape)
+        keep = vals > 0
+        out_anchor.append(rows[keep].astype(xp.int64))
+        out_cand.append(top[keep].astype(xp.int64))
+        out_sim.append(vals[keep].astype(xp.float32))
+        if log is not None and ((b + 1) % report_every == 0 or b + 1 == n_batches):
+            elapsed = time.time() - t_start
+            eta = elapsed / (b + 1) * (n_batches - b - 1)
+            log(f"      tfidf retrieval {b + 1:,}/{n_batches:,} batches, "
+                f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining")
+
+    to_host = (lambda a: a.get()) if hasattr(xp, "asnumpy") else (lambda a: a)
+    return (to_host(xp.concatenate(out_anchor)), to_host(xp.concatenate(out_cand)),
+            to_host(xp.concatenate(out_sim)))
+
+
 def top_k_per_anchor(anchor_matrix: sp.csr_matrix, candidate_matrix: sp.csr_matrix,
-                      k: int, batch_size: int = BATCH_SIZE):
+                      k: int, batch_size: int = BATCH_SIZE, log=None, use_gpu: bool = True):
     """Top-k candidate indices (into candidate_matrix's rows) and their cosine
     similarity, per anchor row (into anchor_matrix's rows). TfidfVectorizer
     output is already L2-normalized, so the sparse dot product IS the cosine
     similarity -- no separate normalization step needed.
+
+    Uses the GPU (CuPy/cuSPARSE, top_k_dense_batches) when available. The CPU
+    path below is the fallback: correct, but at full scale it is
+    single-threaded scipy -- measured ~5x10^7 multiply-adds/s, i.e. hours per
+    large country block even with block-size purging.
 
     Returns three parallel 1-D numpy arrays: anchor_row_idx, candidate_row_idx,
     similarity -- one triple per surviving (anchor, candidate) edge.
@@ -55,6 +157,15 @@ def top_k_per_anchor(anchor_matrix: sp.csr_matrix, candidate_matrix: sp.csr_matr
     if n_anchors == 0 or n_candidates == 0:
         empty = np.array([], dtype=np.int64)
         return empty, empty, np.array([], dtype=np.float32)
+
+    gpu = _get_gpu_backend() if use_gpu else None
+    if gpu is not None:
+        if log is not None:
+            log("      tfidf retrieval backend: GPU (cupy)")
+        cupy, cpsp = gpu
+        return top_k_dense_batches(anchor_matrix, candidate_matrix, k, cupy, cpsp, log=log)
+    if log is not None:
+        log("      tfidf retrieval backend: CPU (scipy) -- slow at full scale")
 
     k = min(k, n_candidates)
     candidate_T = candidate_matrix.T.tocsr()
