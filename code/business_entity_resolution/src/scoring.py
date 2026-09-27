@@ -45,3 +45,31 @@ def macro_f_beta(true_map: dict, pred_map: dict, beta: float = 0.5) -> float:
         for s1_id, true_ids in true_map.items()
     ]
     return sum(scores) / len(scores)
+
+
+def macro_f_beta_arrays(eval_anchors, n_true, pred_anchor_pos, pred_is_true, beta: float = 0.5) -> float:
+    """Vectorized macro_f_beta over integer anchor positions, for full-scale
+    threshold sweeps. Same per-entity rule as f_beta_one_entity:
+      eval_anchors     anchor positions being scored (every one counts)
+      n_true           per-anchor true-match count, indexed by position
+      pred_anchor_pos  anchor position of each predicted pair
+      pred_is_true     1 where that predicted pair is a true match
+    Checked against macro_f_beta on real validation data before use."""
+    import numpy as np
+
+    eval_anchors = np.asarray(eval_anchors)
+    if len(eval_anchors) == 0:
+        return 0.0
+    size = len(n_true)
+    n_pred = np.bincount(pred_anchor_pos, minlength=size)[eval_anchors]
+    tp = np.bincount(pred_anchor_pos, weights=pred_is_true, minlength=size)[eval_anchors]
+    nt = np.asarray(n_true)[eval_anchors]
+
+    f = np.zeros(len(eval_anchors), dtype=np.float64)
+    f[(nt == 0) & (n_pred == 0)] = 1.0
+    ok = (nt > 0) & (tp > 0)
+    p = tp[ok] / n_pred[ok]
+    r = tp[ok] / nt[ok]
+    b2 = beta * beta
+    f[ok] = (1 + b2) * p * r / (b2 * p + r)
+    return float(f.mean())

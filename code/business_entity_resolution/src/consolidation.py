@@ -18,41 +18,46 @@ picking a threshold from raw pair scores: the argmax step changes which
 pairs survive, so macro F0.5 at threshold t has to be measured on the
 CONSOLIDATED predictions at that same t, or the sweep optimizes a different
 objective than the one actually being deployed.
+
+Works on integer positions (pair_table) with numpy, so a sweep over tens of
+millions of validation pairs takes seconds per threshold.
 """
-import pandas as pd
+import numpy as np
 
-from scoring import macro_f_beta
-
-
-def consolidate(scored_pairs: pd.DataFrame, threshold: float, score_col: str = "score") -> dict:
-    """scored_pairs: DataFrame with source1_entity_id, candidate_entity_id,
-    score_col (one row per candidate pair). Returns {source1_entity_id:
-    set(candidate_entity_id)} -- anchors with no surviving candidate are
-    simply absent, matching scoring.py's "missing key == empty prediction"
-    convention."""
-    above = scored_pairs[scored_pairs[score_col] >= threshold]
-    if above.empty:
-        return {}
-    idx = above.groupby("candidate_entity_id")[score_col].idxmax()
-    winners = above.loc[idx]
-    result = {}
-    for s1_id, cid in zip(winners["source1_entity_id"], winners["candidate_entity_id"]):
-        result.setdefault(s1_id, set()).add(cid)
-    return result
+from scoring import macro_f_beta_arrays
 
 
-def sweep_threshold(scored_pairs: pd.DataFrame, true_map: dict, thresholds,
-                     score_col: str = "score"):
-    """For each candidate threshold: consolidate -> compute macro F0.5 against
-    true_map. `true_map` must cover every anchor in the evaluation set,
-    including ones with zero surviving candidates (they score via
-    scoring.py's empty-prediction rule either way). Returns
-    (best_threshold, best_score, [(t, score), ...] for every threshold tried).
-    """
+def consolidate(anchor_pos: np.ndarray, other_pos: np.ndarray, score: np.ndarray,
+                threshold: float) -> np.ndarray:
+    """Boolean mask over the pairs: True where the pair is predicted as a
+    match -- score >= threshold AND it is the highest-scoring surviving pair
+    for its candidate record (ties keep the earliest pair)."""
+    keep = np.zeros(len(score), dtype=bool)
+    above = np.flatnonzero(score >= threshold)
+    if len(above) == 0:
+        return keep
+    # Sort surviving pairs by candidate, then by descending score (lexsort is
+    # stable, so equal scores stay in original order); the first pair of
+    # each candidate run is its argmax.
+    order = above[np.lexsort((-score[above], other_pos[above]))]
+    cand_sorted = other_pos[order]
+    first = np.ones(len(order), dtype=bool)
+    first[1:] = cand_sorted[1:] != cand_sorted[:-1]
+    keep[order[first]] = True
+    return keep
+
+
+def sweep_threshold(anchor_pos, other_pos, score, label, eval_anchors, n_true, thresholds):
+    """For each candidate threshold: consolidate -> macro F0.5 over
+    `eval_anchors` (EVERY anchor in the evaluation set, including ones
+    blocking found no candidates for -- they score by the singleton rule
+    either way). `label` marks true pairs, `n_true` is the per-anchor count
+    of true matches (indexed by anchor position). Returns (best_threshold,
+    best_score, [(t, score), ...])."""
     results = []
     for t in thresholds:
-        pred_map = consolidate(scored_pairs, t, score_col)
-        score = macro_f_beta(true_map, pred_map)
-        results.append((t, score))
+        pred = consolidate(anchor_pos, other_pos, score, t)
+        s = macro_f_beta_arrays(eval_anchors, n_true, anchor_pos[pred], label[pred])
+        results.append((float(t), s))
     best_t, best_score = max(results, key=lambda x: x[1])
     return best_t, best_score, results
