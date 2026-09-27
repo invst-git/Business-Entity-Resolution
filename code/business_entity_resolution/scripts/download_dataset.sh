@@ -31,13 +31,35 @@ echo "Unzipping into $DATASET_DIR ..."
 mkdir -p "$DATASET_DIR"
 unzip -oq "$ZIP_PATH" -d "$DATASET_DIR"
 
-# Handle both possible zip layouts: contents zipped directly (train/, test/ at the
-# top level) or the whole dataset/ folder zipped (one extra nesting level).
-if [ -d "$DATASET_DIR/dataset/train" ] && [ ! -d "$DATASET_DIR/train" ]; then
-    echo "Zip contained a nested dataset/ folder -- flattening..."
-    mv "$DATASET_DIR/dataset"/* "$DATASET_DIR/"
-    rmdir "$DATASET_DIR/dataset"
+# The zip's internal layout depends entirely on how it was created locally --
+# contents zipped directly, the dataset/ folder zipped (one extra level), or a
+# whole project folder zipped (dataset/student_resource/dataset/..., two extra
+# levels). Rather than assume a specific nesting depth, find the actual train/
+# and test/ directories by name, wherever they landed, and move them to the top
+# of $DATASET_DIR.
+FOUND_TRAIN=$(find "$DATASET_DIR" -type d -name train | head -1)
+FOUND_TEST=$(find "$DATASET_DIR" -type d -name test | head -1)
+
+if [ -z "$FOUND_TRAIN" ] || [ -z "$FOUND_TEST" ]; then
+    echo "ERROR: could not find both a 'train' and 'test' folder anywhere inside the extracted zip." >&2
+    echo "Extracted contents:" >&2
+    find "$DATASET_DIR" -maxdepth 4 >&2
+    exit 1
 fi
+
+if [ "$FOUND_TRAIN" != "$DATASET_DIR/train" ]; then
+    echo "Found train/ nested at ${FOUND_TRAIN#"$DATASET_DIR"/} -- moving to dataset/train"
+    rm -rf "$DATASET_DIR/train"
+    mv "$FOUND_TRAIN" "$DATASET_DIR/train"
+fi
+if [ "$FOUND_TEST" != "$DATASET_DIR/test" ]; then
+    echo "Found test/ nested at ${FOUND_TEST#"$DATASET_DIR"/} -- moving to dataset/test"
+    rm -rf "$DATASET_DIR/test"
+    mv "$FOUND_TEST" "$DATASET_DIR/test"
+fi
+
+# Clean up whatever empty wrapper directories the move left behind.
+find "$DATASET_DIR" -mindepth 1 -maxdepth 4 -type d -empty -delete
 
 rm -f "$ZIP_PATH"
 
