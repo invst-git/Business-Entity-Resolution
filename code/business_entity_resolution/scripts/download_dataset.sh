@@ -34,11 +34,14 @@ unzip -oq "$ZIP_PATH" -d "$DATASET_DIR"
 # The zip's internal layout depends entirely on how it was created locally --
 # contents zipped directly, the dataset/ folder zipped (one extra level), or a
 # whole project folder zipped (dataset/student_resource/dataset/..., two extra
-# levels). Rather than assume a specific nesting depth, find the actual train/
-# and test/ directories by name, wherever they landed, and move them to the top
-# of $DATASET_DIR.
-FOUND_TRAIN=$(find "$DATASET_DIR" -type d -name train | head -1)
-FOUND_TEST=$(find "$DATASET_DIR" -type d -name test | head -1)
+# levels, and on macOS often bundled with a __MACOSX/ resource-fork mirror that
+# contains its OWN same-named train/test directories full of junk ._* files).
+# Rather than assume a specific nesting depth, find the real train/ and test/
+# directories by name -- excluding __MACOSX, whose decoy copies could otherwise
+# be picked instead depending on filesystem traversal order -- wherever they
+# landed, and move them to the top of $DATASET_DIR.
+FOUND_TRAIN=$(find "$DATASET_DIR" -type d -name train -not -path '*/__MACOSX/*' | head -1)
+FOUND_TEST=$(find "$DATASET_DIR" -type d -name test -not -path '*/__MACOSX/*' | head -1)
 
 if [ -z "$FOUND_TRAIN" ] || [ -z "$FOUND_TEST" ]; then
     echo "ERROR: could not find both a 'train' and 'test' folder anywhere inside the extracted zip." >&2
@@ -58,8 +61,10 @@ if [ "$FOUND_TEST" != "$DATASET_DIR/test" ]; then
     mv "$FOUND_TEST" "$DATASET_DIR/test"
 fi
 
-# Clean up whatever empty wrapper directories the move left behind.
-find "$DATASET_DIR" -mindepth 1 -maxdepth 4 -type d -empty -delete
+# Discard everything else the zip brought along -- wrapper project folders,
+# __MACOSX, .DS_Store, README duplicates, whatever else. Only train/ and test/
+# are needed under $DATASET_DIR.
+find "$DATASET_DIR" -mindepth 1 -maxdepth 1 ! -name train ! -name test -exec rm -rf {} +
 
 rm -f "$ZIP_PATH"
 
