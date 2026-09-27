@@ -50,29 +50,49 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def name_address_text(df: pd.DataFrame) -> pd.Series:
+    """Text for the name+address TF-IDF channel. The full-scale recall check
+    showed name-only retrieval drowns in same-name lookalikes at different
+    addresses (e.g. one 'Summit Society LLC' per city), while true matches
+    share the address even when the name is noisy. char_wb n-grams are
+    word-order-free, so the randomized address component order doesn't
+    matter."""
+    return df["core_name_compare"] + " " + df["address_ascii"]
+
+
+def tfidf_channel(tag, vec, s1_text, target_text, k, max_block_size):
+    t0 = time.time()
+    s1_mat = vec.transform(s1_text)
+    target_mat = vec.transform(target_text)
+    s1_mat, target_mat, n_kept, n_dropped = tfidf_blocking.prune_common_terms(
+        s1_mat, target_mat, max_block_size
+    )
+    log(f"    {tag} tfidf transform done in {time.time() - t0:.1f}s -- kept {n_kept:,} n-grams, "
+        f"purged {n_dropped:,} with candidate block size > {max_block_size:,} -- retrieving top-{k}...")
+    t0 = time.time()
+    edges = tfidf_blocking.top_k_per_anchor(s1_mat, target_mat, k, log=log)
+    log(f"    {tag} tfidf retrieval done in {time.time() - t0:.1f}s ({len(edges[0]):,} edges)")
+    return edges
+
+
 def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: int,
                       embed_model=None, s1_embeddings=None,
                       max_block_size: int = tfidf_blocking.MAX_BLOCK_SIZE,
-                      exact_max_block: int = exact_blocking.MAX_KEY_BLOCK):
-    """Runs the TF-IDF, exact-match, and (if enabled) embedding channels for
-    one (country, target source) pair, returns (anchor_idx, candidate_idx,
+                      exact_max_block: int = exact_blocking.MAX_KEY_BLOCK,
+                      na_vec=None):
+    """Runs the name TF-IDF, name+address TF-IDF, exact-match, and (if
+    enabled) embedding channels for one (country, target source) pair,
+    fuses them by reciprocal rank, returns (anchor_idx, candidate_idx,
     weight) edges pruned to budget k. `s1_embeddings` is precomputed once per
     country and passed in, since it's shared across both target sources."""
     if len(s1_c) == 0 or len(target_c) == 0:
         empty = np.array([], dtype=np.int64)
         return empty, empty, np.array([], dtype=np.float32)
 
-    t0 = time.time()
-    s1_mat = tfidf_vec.transform(s1_c["core_name_compare"])
-    target_mat = tfidf_vec.transform(target_c["core_name_compare"])
-    s1_mat, target_mat, n_kept, n_dropped = tfidf_blocking.prune_common_terms(
-        s1_mat, target_mat, max_block_size
-    )
-    log(f"    tfidf transform done in {time.time() - t0:.1f}s -- kept {n_kept:,} n-grams, "
-        f"purged {n_dropped:,} with candidate block size > {max_block_size:,} -- retrieving top-{k}...")
-    t0 = time.time()
-    tfidf_edges = tfidf_blocking.top_k_per_anchor(s1_mat, target_mat, k, log=log)
-    log(f"    tfidf retrieval done in {time.time() - t0:.1f}s ({len(tfidf_edges[0]):,} edges)")
+    tfidf_edges = tfidf_channel("name", tfidf_vec, s1_c["core_name_compare"], target_c["core_name_compare"],
+                                k, max_block_size)
+    na_edges = tfidf_channel("name+address", na_vec, name_address_text(s1_c), name_address_text(target_c),
+                             k, max_block_size)
 
     t0 = time.time()
     exact_df = exact_blocking.exact_match_candidates(s1_c, target_c, exact_max_block)
@@ -87,7 +107,7 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
         exact_edges = (empty, empty, np.array([], dtype=np.float32))
     log(f"    exact-match done in {time.time() - t0:.1f}s ({len(exact_edges[0]):,} edges)")
 
-    channels = [tfidf_edges, exact_edges]
+    channels = [tfidf_edges, na_edges, exact_edges]
     if embed_model is not None:
         t0 = time.time()
         target_embeddings = embedding_blocking.embed_texts(embed_model, target_c["core_name"].tolist())
@@ -100,9 +120,9 @@ def block_one_target(s1_c: pd.DataFrame, target_c: pd.DataFrame, tfidf_vec, k: i
         channels.append(emb_edges)
 
     t0 = time.time()
-    merged = meta_blocking.union_edges(channels, len(s1_c), len(target_c))
+    merged = meta_blocking.rrf_union_edges(channels, len(s1_c), len(target_c))
     result = meta_blocking.prune_to_budget(merged, k)
-    log(f"    union+prune done in {time.time() - t0:.1f}s")
+    log(f"    rank-fusion+prune done in {time.time() - t0:.1f}s")
     return result
 
 
@@ -127,6 +147,11 @@ def run_country(country: str, s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFra
     tfidf_vec = tfidf_blocking.fit_vectorizer(all_text)
     log(f"[{country}] vocab size={len(tfidf_vec.vocabulary_):,}")
     del all_text
+    all_na = pd.concat([name_address_text(s1_c), name_address_text(s2_c), name_address_text(s3_c)])
+    log(f"[{country}] fitting shared name+address TF-IDF vectorizer on {len(all_na):,} texts...")
+    na_vec = tfidf_blocking.fit_vectorizer(all_na)
+    log(f"[{country}] name+address vocab size={len(na_vec.vocabulary_):,}")
+    del all_na
     gc.collect()
 
     s1_embeddings = None
@@ -142,7 +167,7 @@ def run_country(country: str, s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFra
         a_idx, c_idx, _ = block_one_target(s1_c, target_c, tfidf_vec, k,
                                             embed_model=embed_model, s1_embeddings=s1_embeddings,
                                             max_block_size=max_block_size,
-                                            exact_max_block=exact_max_block)
+                                            exact_max_block=exact_max_block, na_vec=na_vec)
         log(f"[{country}] {tag}: {len(a_idx):,} candidate edges in {time.time() - t0:.1f}s")
         s1_ids = s1_c["entity_id"].to_numpy()
         cand_ids = target_c["entity_id"].to_numpy()

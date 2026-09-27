@@ -38,6 +38,45 @@ def union_edges(channel_edges, n_anchors, n_candidates):
     return mat.tocsr()  # duplicate (row, col) entries are summed on coo->csr conversion
 
 
+RRF_K0 = 60
+
+
+def _min_rank_within_anchor(anchor_idx: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """1-based rank of each edge among its anchor's edges by descending
+    weight, ties sharing the best rank (so a constant-weight channel like
+    exact-match gives every hit rank 1, not an arbitrary 1..n order)."""
+    order = np.lexsort((-weight, anchor_idx))
+    a_s, w_s = anchor_idx[order], weight[order]
+    n = len(order)
+    pos = np.arange(n)
+    new_anchor = np.ones(n, dtype=bool)
+    new_anchor[1:] = a_s[1:] != a_s[:-1]
+    new_value = new_anchor.copy()
+    new_value[1:] |= w_s[1:] != w_s[:-1]
+    group_start = np.maximum.accumulate(np.where(new_anchor, pos, 0))
+    value_start = np.maximum.accumulate(np.where(new_value, pos, 0))
+    ranks = np.empty(n, dtype=np.float32)
+    ranks[order] = value_start - group_start + 1
+    return ranks
+
+
+def rrf_union_edges(channel_edges, n_anchors, n_candidates, k0: int = RRF_K0):
+    """Reciprocal-rank fusion: each channel contributes 1/(k0 + rank) per
+    edge, rank taken within the anchor's own list for that channel, summed
+    across channels. Replaces summing raw scores, which live on different
+    scales per channel (e5 cosines crowd into a narrow high band, exact-match
+    is a constant 1.0, TF-IDF cosines spread over 0-1) -- at full scale that
+    let embedding-/exact-only lookalikes (same name, different address; or
+    same house number, different business) outrank true matches that
+    TF-IDF had ranked highly. Hit live: full-train pair recall was 73.6%."""
+    fused = []
+    for a, c, w in channel_edges:
+        if len(a) == 0:
+            continue
+        fused.append((a, c, (1.0 / (k0 + _min_rank_within_anchor(a, w))).astype(np.float32)))
+    return union_edges(fused, n_anchors, n_candidates)
+
+
 def prune_to_budget(edge_matrix: sp.csr_matrix, k: int):
     """Per-anchor (per-row) top-k by weight -- plain Cardinality Node
     Pruning, anchor side only. Returns (anchor_idx, candidate_idx, weight)
