@@ -1,0 +1,17 @@
+# Core -- works with or without a GPU present.
+pyarrow>=14.0
+numpy>=1.24
+
+# pandas is intentionally NOT pinned here. scripts/setup_env.sh installs RAPIDS
+# cudf.pandas, which brings in the pandas version it has been validated against;
+# pinning a different pandas here first can conflict with that install. If you
+# are running CPU-only, any pandas>=2.0 works fine with this codebase.
+
+# Later phases (blocking / matching model) -- not required just to run
+# src/run_preprocessing.py, listed here so the whole pipeline installs in one shot.
+rapidfuzz>=3.0
+jellyfish>=1.0
+scikit-learn>=1.3
+
+# Drive -> qBraid dataset transfer
+gdown>=5.0
